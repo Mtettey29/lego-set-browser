@@ -1,0 +1,46 @@
+name: Build and push image to ACR and update Container App
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  ACR_NAME: acrlegosetsabcd
+  ACR_LOGIN_SERVER: acrlegosetsabcd.azurecr.io
+  IMAGE_NAME: ca-web-lego
+  RESOURCE_GROUP: rg-lego-set-browser-dev
+  CONTAINERAPP_NAME: ca-web-lego-abcd
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: ACR login
+        run: |
+          az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Build and push image
+        run: |
+          docker build -t ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest .
+          docker push ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Ensure containerapp extension
+        run: |
+          az extension add --name containerapp || az extension update --name containerapp
+
+      - name: Update Container App image
+        run: |
+          az containerapp update -g ${{ env.RESOURCE_GROUP }} -n ${{ env.CONTAINERAPP_NAME }} --image ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Verify endpoint (best-effort)
+        run: |
+          sleep 10
+          curl -fsS https://${{ env.CONTAINERAPP_NAME }}.calmrock-4a13cc87.francecentral.azurecontainerapps.io || echo "endpoint check failed"
