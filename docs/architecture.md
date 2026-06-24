@@ -92,6 +92,14 @@ graph TB
     class cosmos,cdb,ccol data;
 ```
 
+### Diagram legend
+
+| Line style | Meaning |
+|------------|---------|
+| Solid arrow (`-->`) | Data or telemetry path (HTTPS, SDK, image pull, diagnostics) |
+| Thick solid (`==>`) | RBAC / data-plane role assignment |
+| Dashed (`-.->`) | Managed identity binding (not a network hop) |
+
 ## Resource inventory
 
 | Resource | Type | Notes |
@@ -133,54 +141,17 @@ graph TB
 
 The deployed dev topology above is a valid lab footprint. Production should **consume an existing
 Cosmos account** owned by a platform or data team, tighten network boundaries, and consolidate
-observability. The table below prioritizes gaps; items marked *already good* should be preserved
+observability. Preserve managed-identity RBAC, `disableLocalAuth`, HTTPS-only ingress, and probes
 when promoting to prod.
 
-### Already good (carry forward)
-
-- **Managed identity + data-plane RBAC** — Container App (system MI, Data Reader) and Function (UAMI, Data Contributor); no connection strings for Cosmos.
-- **`disableLocalAuth: true`** on Cosmos — key-based auth disabled end-to-end.
-- **No secrets in app settings** for Cosmos or ACR pull (system MI + `AcrPull`).
-- **ACR admin user disabled** — registry access via MI only.
-- **Probes and scale rules** on the Container App (liveness/readiness, HTTP concurrent scaling).
-- **HTTPS-only ingress** on the Container App (`allowInsecure: false`).
-- **Basic 5xx alerting** via `alert-lego-5xx` against Container App telemetry.
-
-### Gap priorities
-
-| Priority | Gap | Current state | Production target |
-|----------|-----|---------------|-------------------|
-| **High** | Cosmos as external/shared dependency | Account `cosmos-lego-sets` lives in the app resource group and is created by app IaC. | Cosmos account in a **platform or data RG** (possibly another subscription). App IaC **does not create** the account; it grants MI role assignments only. Clear ownership split: platform owns account lifecycle, backups, and capacity; app team owns containers and MI bindings. |
-| **High** | Network isolation | Cosmos public network **Enabled**; no private endpoints. ACA environment has no VNet injection. ACR Basic with public network. | **Private endpoint** on Cosmos; **disable public network access**. **VNet-injected** Container Apps environment with outbound via NAT/subnet. **ACR Premium** with private endpoint; image pull over private link. Function host storage remains in app RG with network rules aligned to the VNet. |
-| **High** | Deployer human on Cosmos | Human principal `fbecc709` holds **Data Contributor** on Cosmos. | **Remove deployer Data Contributor** in prod. Break-glass access via PIM-eligible roles or a separate ops pipeline identity — not standing human data-plane access. |
-| **High** | Unified observability | Two App Insights components; Function telemetry lands in a **default workspace outside the RG**; no ACA env app logs; no Cosmos diagnostic settings. | **Single Log Analytics workspace** for the app. ACA environment app logs → same workspace. Function App Insights → same workspace. **Cosmos diagnostic settings** (DataPlaneRequests, QueryRuntimeStatistics, PartitionKeyStatistics) → same workspace. Alerts for **429 / throttling**, ingest failures, and sustained 5xx. |
-| **Medium** | Edge protection | Container App exposed directly via ACA ingress FQDN. | **Azure Front Door** (or Application Gateway) with **WAF** in front of ACA; optional custom domain and managed certificates at the edge. |
-| **Medium** | Function ingest auth | Ingest endpoint reachable without an app-layer auth gate (relies on obscurity + Azure platform auth). | Protect ingest via **API Management** or **Entra ID**-secured HTTP trigger (function-level auth, APIM subscription key, or OAuth). |
-| **Medium** | Cosmos capacity & geo | Single-region account; RU/capacity not aligned to a prod SLO document. | **Autoscale or provisioned RU** sized to prod traffic; **multi-region write** or read-region alignment with the app tier region choice. |
-| **Medium** | DR / multi-region app tier | Single region (France Central) for web and API. | Document RTO/RPO; consider secondary ACA environment + Front Door origin group, or accept single-region with Cosmos geo-redundancy only. |
-| **Low** | Tagging & policy | Minimal cost/ownership tags on resources. | Mandatory tags (environment, owner, cost center); Azure Policy assignments for allowed SKUs, PE requirements, and diagnostic settings. |
-| **Low** | Environment separation | Dev RG hosts the only deployment. | Separate **dev / staging / prod** resource groups or subscriptions; distinct ACA environments and MIs per stage; shared Cosmos with database-level isolation or separate accounts per env per platform policy. |
-| **Low** | Deployment strategy | Single active revision per Container App. | **Blue/green or traffic-split revisions** on ACA for zero-downtime releases; staged Function deployment slots where supported. |
-
-### Production target topology (Cosmos external)
-
-The diagram below highlights the **network and ownership boundary** change: Cosmos moves out of
-the app resource group, connects via private endpoint, and MIs in the app RG receive cross-RG
-role assignments.
+### Production target architecture
 
 ```mermaid
 graph TB
     user["User / Browser"]
-    fd["Azure Front Door + WAF<br/>optional edge tier"]
+    fd["Azure Front Door + WAF<br/>edge tier"]
 
-    subgraph PLATFORM["Platform / Data RG<br/>possibly different subscription"]
-        cosmos["Cosmos DB account<br/>EXISTING shared account<br/>disableLocalAuth: TRUE<br/>public network: DISABLED"]
-        cpe["Private Endpoint<br/>cosmos-pe"]
-        cdb["SQL Database<br/>LegoDatabase"]
-        ccol["Container<br/>legoSets"]
-    end
-
-    subgraph APP["App RG — rg-lego-set-browser-prod"]
+    subgraph APP_RG["App RG"]
         vnet["VNet<br/>aca-subnet + pe-subnet"]
 
         subgraph WEB["Web Tier — VNet injected"]
@@ -191,8 +162,8 @@ graph TB
         end
 
         subgraph API["API Tier"]
-            fa["Function App<br/>Flex Consumption<br/>UAMI Data Contributor"]
-            uami["User-assigned MI"]
+            fa["Function App<br/>fa-lego-flex<br/>Flex Consumption<br/>UAMI Data Contributor"]
+            uami["User-assigned MI<br/>uaid-fa-lego-sets"]
         end
 
         subgraph OBS["Unified Observability"]
@@ -202,36 +173,61 @@ graph TB
         end
     end
 
+    subgraph COSMOS_RG["Cosmos RG / Platform"]
+        cosmos["Cosmos DB account<br/>EXISTING shared account<br/>disableLocalAuth: TRUE<br/>public network: DISABLED"]
+        cpe["Private Endpoint<br/>cosmos-pe"]
+        cdb["SQL Database<br/>LegoDatabase"]
+        ccol["Container<br/>legoSets<br/>partition key /id"]
+    end
+
     user -->|HTTPS| fd
     fd -->|origin| ca
     vnet --> acaenv
-    acaenv --> ca
-    acr -->|AcrPull via PE| ca
-    ca -.-> casi
-    fa -.-> uami
+    acaenv -->|hosts| ca
+    acr -->|AcrPull via private link| ca
+    ca -. system-assigned MI .-> casi
+    fa -. user-assigned MI .-> uami
 
-    ca -->|read via private link| cpe
-    fa -->|write via private link| cpe
+    ca -->|read items via private link| cpe
+    fa -->|upsert items via private link| cpe
     cpe --> cosmos
     cosmos --> cdb --> ccol
 
     casi ==>|Cosmos SQL Data Reader<br/>cross-RG RBAC| cosmos
     uami ==>|Cosmos SQL Data Contributor<br/>cross-RG RBAC| cosmos
 
-    ca --> appi
-    fa --> appi
+    ca -->|telemetry| appi
+    fa -->|telemetry| appi
     appi --> law
     acaenv -->|app logs| law
     cosmos -->|diagnostic settings| law
     law --> alert
 
+    classDef external fill:#f8f9fa,stroke:#6c757d,stroke-width:1px,color:#212529;
     classDef platform fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px,color:#1b5e20;
     classDef identity fill:#fff3cd,stroke:#d39e00,stroke-width:1px,color:#664d03;
     classDef data fill:#cfe2ff,stroke:#0a58ca,stroke-width:1px,color:#084298;
 
+    class user,fd external;
     class cosmos,cdb,ccol,cpe platform;
     class casi,uami identity;
 ```
+
+### Gap priorities
+
+| Priority | Gap | Current state | Production target |
+|----------|-----|---------------|-------------------|
+| **High** | Cosmos as external/shared dependency | Account `cosmos-lego-sets` lives in the app resource group and is created by app IaC. | Cosmos account in a **platform or data RG** (possibly another subscription). App IaC **does not create** the account; it grants MI role assignments only. |
+| **High** | Network isolation | Cosmos public network **Enabled**; no private endpoints. ACA environment has no VNet injection. ACR Basic with public network. | **Private endpoint** on Cosmos; **disable public network access**. **VNet-injected** ACA environment. **ACR Premium** with private endpoint; image pull over private link. |
+| **High** | Deployer human on Cosmos | Human principal `fbecc709` holds **Data Contributor** on Cosmos. | **No standing human Data Contributor** in prod. Break-glass via PIM-eligible roles or ops pipeline identity only. |
+| **High** | Unified observability | Two App Insights components; Function telemetry in a **default workspace outside the RG**; no ACA env app logs; no Cosmos diagnostic settings. | **Single Log Analytics workspace**. ACA app logs, Function App Insights, and **Cosmos diagnostic settings** → same workspace. Alerts for **429 / throttling**, ingest failures, and sustained 5xx. |
+| **Medium** | Edge protection | Container App exposed directly via ACA ingress FQDN. | **Azure Front Door** with **WAF** in front of ACA; optional custom domain and managed certificates. |
+| **Medium** | Function ingest auth | Ingest endpoint reachable without an app-layer auth gate. | Protect ingest via **API Management** or **Entra ID**-secured HTTP trigger. |
+| **Medium** | Cosmos capacity & geo | Single-region account; RU/capacity not aligned to a prod SLO. | **Autoscale or provisioned RU** sized to prod traffic; multi-region write or read-region alignment. |
+| **Medium** | DR / multi-region app tier | Single region (France Central) for web and API. | Document RTO/RPO; secondary ACA + Front Door origin group, or single-region with Cosmos geo-redundancy only. |
+| **Low** | Tagging & policy | Minimal cost/ownership tags on resources. | Mandatory tags; Azure Policy for allowed SKUs, PE requirements, and diagnostic settings. |
+| **Low** | Environment separation | Dev RG hosts the only deployment. | Separate **dev / staging / prod** RGs; distinct ACA environments and MIs per stage. |
+| **Low** | Deployment strategy | Single active revision per Container App. | **Blue/green or traffic-split revisions** on ACA; staged Function deployment where supported. |
 
 ### Cosmos connection checklist (existing account)
 
