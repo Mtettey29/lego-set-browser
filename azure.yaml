@@ -1,0 +1,10 @@
+name: lego-set-browser
+services:
+  function:
+    project: ./src/azure_function
+    language: python
+    appName: fa-lego-sets
+  web:
+    project: .
+    language: python
+    containerName: ca-web-lego-XXXX

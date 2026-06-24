@@ -1,0 +1,207 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "languageVersion": "2.0",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.44.1.10279",
+      "templateHash": "5899612391828122869"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "francecentral",
+      "metadata": {
+        "description": "Container Apps environment + container app for Flask web app"
+      }
+    },
+    "environmentName": {
+      "type": "string",
+      "defaultValue": "aca-env-lego"
+    },
+    "containerAppNamePrefix": {
+      "type": "string",
+      "defaultValue": "ca-web-lego-"
+    },
+    "suffix": {
+      "type": "string",
+      "defaultValue": "XXXX"
+    },
+    "containerImage": {
+      "type": "string",
+      "defaultValue": "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest"
+    },
+    "cosmosEndpoint": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "cosmosDatabase": {
+      "type": "string",
+      "defaultValue": "LegoDatabase"
+    },
+    "cosmosContainer": {
+      "type": "string",
+      "defaultValue": "legoSets"
+    },
+    "acrLoginServer": {
+      "type": "string",
+      "defaultValue": "acrlegosetsabcd.azurecr.io",
+      "metadata": {
+        "description": "Name of the Azure Container Registry the container app pulls from (pull via system-assigned identity)."
+      }
+    },
+    "cosmosAccountName": {
+      "type": "string",
+      "defaultValue": "cosmos-lego-sets",
+      "metadata": {
+        "description": "Name of the existing Cosmos DB account to grant the container app data-plane read access to."
+      }
+    },
+    "appInsightsName": {
+      "type": "string",
+      "defaultValue": "appi-lego",
+      "metadata": {
+        "description": "Name of the existing workspace-based Application Insights component. Referenced (not hardcoded) so the connection string is never stored in source."
+      }
+    }
+  },
+  "variables": {
+    "containerAppName": "[format('{0}{1}', parameters('containerAppNamePrefix'), parameters('suffix'))]",
+    "cosmosDataReaderRoleId": "00000000-0000-0000-0000-000000000001"
+  },
+  "resources": {
+    "containerEnv": {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2024-03-01",
+      "name": "[parameters('environmentName')]",
+      "location": "[parameters('location')]",
+      "properties": {}
+    },
+    "appInsights": {
+      "existing": true,
+      "type": "Microsoft.Insights/components",
+      "apiVersion": "2020-02-02",
+      "name": "[parameters('appInsightsName')]"
+    },
+    "containerApp": {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('containerAppName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('environmentName'))]",
+        "configuration": {
+          "registries": [
+            {
+              "server": "[parameters('acrLoginServer')]",
+              "identity": "system"
+            }
+          ],
+          "ingress": {
+            "external": true,
+            "targetPort": 8000,
+            "allowInsecure": false
+          }
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "web",
+              "image": "[parameters('containerImage')]",
+              "resources": {
+                "cpu": 1,
+                "memory": "2Gi"
+              },
+              "env": [
+                {
+                  "name": "COSMOS_ENDPOINT",
+                  "value": "[parameters('cosmosEndpoint')]"
+                },
+                {
+                  "name": "COSMOS_DATABASE",
+                  "value": "[parameters('cosmosDatabase')]"
+                },
+                {
+                  "name": "COSMOS_CONTAINER",
+                  "value": "[parameters('cosmosContainer')]"
+                },
+                {
+                  "name": "APPLICATIONINSIGHTS_CONNECTION_STRING",
+                  "value": "[reference('appInsights').ConnectionString]"
+                }
+              ],
+              "probes": [
+                {
+                  "type": "Liveness",
+                  "httpGet": {
+                    "path": "/",
+                    "port": 8000
+                  },
+                  "initialDelaySeconds": 10,
+                  "periodSeconds": 30
+                },
+                {
+                  "type": "Readiness",
+                  "httpGet": {
+                    "path": "/",
+                    "port": 8000
+                  },
+                  "initialDelaySeconds": 5,
+                  "periodSeconds": 10
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": 1,
+            "maxReplicas": 3,
+            "rules": [
+              {
+                "name": "http-scale",
+                "http": {
+                  "metadata": {
+                    "concurrentRequests": "50"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "dependsOn": [
+        "appInsights",
+        "containerEnv"
+      ]
+    },
+    "cosmosAccount": {
+      "existing": true,
+      "type": "Microsoft.DocumentDB/databaseAccounts",
+      "apiVersion": "2024-05-15",
+      "name": "[parameters('cosmosAccountName')]"
+    },
+    "cosmosDataReaderAssignment": {
+      "type": "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments",
+      "apiVersion": "2024-05-15",
+      "name": "[format('{0}/{1}', parameters('cosmosAccountName'), guid(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosAccountName')), resourceId('Microsoft.App/containerApps', variables('containerAppName')), variables('cosmosDataReaderRoleId')))]",
+      "properties": {
+        "roleDefinitionId": "[format('{0}/sqlRoleDefinitions/{1}', resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosAccountName')), variables('cosmosDataReaderRoleId'))]",
+        "principalId": "[reference('containerApp', '2024-03-01', 'full').identity.principalId]",
+        "scope": "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosAccountName'))]"
+      },
+      "dependsOn": [
+        "containerApp"
+      ]
+    }
+  },
+  "outputs": {
+    "containerAppName": {
+      "type": "string",
+      "value": "[variables('containerAppName')]"
+    }
+  }
+}

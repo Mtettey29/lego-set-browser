@@ -1,0 +1,9 @@
+# Diagnostic / deployment dumps (may contain environment-specific or sensitive data)
+tokencheck.json
+scopecheck.json
+func_deploy.json
+ca_deploy.json
+ca_redeploy.json
+
+# Local azd / deployment planning artifacts (contain subscription-specific identifiers)
+.azure/
